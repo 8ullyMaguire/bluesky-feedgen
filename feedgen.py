@@ -34,6 +34,7 @@ If multiple unrelated users subscribe and you want each of them to keep seeing
 top posts until they personally interact, that is not implemented here and is
 flagged below as future work.
 """
+
 import json
 import os
 import threading
@@ -73,13 +74,16 @@ ENV = load_dotenv(".env") | dict(os.environ)
 HOSTNAME = CFG["hostname"]
 SERVICE_DID = f"did:web:{HOSTNAME}"
 PUBLISHER_DID = CFG["publisher_did"]
-FEEDS = {f"at://{PUBLISHER_DID}/app.bsky.feed.generator/{f['rkey']}": f
-         for f in CFG["feeds"]}
+FEEDS = {
+    f"at://{PUBLISHER_DID}/app.bsky.feed.generator/{f['rkey']}": f for f in CFG["feeds"]
+}
 
 CACHE = {"feeds": {}, "updated": 0, "scanned": 0, "members": 0, "error": None}
 CACHE_LOCK = threading.Lock()
 
-STATE_PATH = os.environ.get("FEEDGEN_STATE_PATH") or os.path.join(BASE, "feedgen-state.json")
+STATE_PATH = os.environ.get("FEEDGEN_STATE_PATH") or os.path.join(
+    BASE, "feedgen-state.json"
+)
 _state = {"seen": {f["rkey"]: set() for f in CFG["feeds"]}}
 _state_lock = threading.Lock()
 
@@ -127,10 +131,13 @@ def rpc(host, method, data=None, token=None):
     req = urllib.request.Request(
         f"{host}/xrpc/{method}",
         data=json.dumps(data).encode() if data is not None else None,
-        headers={"Content-Type": "application/json",
-                 "User-Agent": "leftist-feedgen/1.0"}
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "leftist-feedgen/1.0",
+        }
         | ({"Authorization": f"Bearer {token}"} if token else {}),
-        method="POST" if data is not None else "GET")
+        method="POST" if data is not None else "GET",
+    )
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.load(r)
@@ -159,8 +166,11 @@ def select(posts, fcfg, sc, now, owner):
         age_h = (now - parse_time(ts)).total_seconds() / 3600
         if not (fcfg.get("min_age_hours", 0) <= age_h <= fcfg["max_age_hours"]):
             continue
-        is_owner = (owner.get("always_include") and owner.get("did")
-                    and (p.get("author") or {}).get("did") == owner["did"])
+        is_owner = (
+            owner.get("always_include")
+            and owner.get("did")
+            and (p.get("author") or {}).get("did") == owner["did"]
+        )
         likes = p.get("likeCount", 0)
         reposts = p.get("repostCount", 0)
         quotes = p.get("quoteCount", 0)
@@ -168,10 +178,15 @@ def select(posts, fcfg, sc, now, owner):
         if fcfg.get("min_reposts_share"):
             if likes <= 0 or reposts < likes * fcfg["min_reposts_share"]:
                 continue
-        s = likes * sc["w_likes"] + reposts * sc["w_reposts"] \
-            + quotes * sc["w_quotes"] + replies * sc["w_replies"]
+        s = (
+            likes * sc["w_likes"]
+            + reposts * sc["w_reposts"]
+            + quotes * sc["w_quotes"]
+            + replies * sc["w_replies"]
+        )
         if fcfg.get("ranking") == "trending" and age_h > 0:
-            s = s / age_h
+            decay = fcfg.get("decay_factor", 0.8)
+            s = s / (1 + age_h**decay)
         if is_owner:
             s = s * owner.get("boost", 1.0) + owner.get("bonus", 0.0)
         else:
@@ -209,8 +224,11 @@ def refresh():
     password = ENV.get("BSKY_APP_PASSWORD")
     if not handle or not password:
         raise RuntimeError("missing BSKY_HANDLE/BSKY_APP_PASSWORD in feedgen .env")
-    sess = rpc(src["pds_host"], "com.atproto.server.createSession",
-               {"identifier": handle, "password": password})
+    sess = rpc(
+        src["pds_host"],
+        "com.atproto.server.createSession",
+        {"identifier": handle, "password": password},
+    )
     token = sess["accessJwt"]
     appview = src["appview_host"]
     owner_did = CFG.get("owner", {}).get("did")
@@ -218,14 +236,16 @@ def refresh():
     while True:
         q = urllib.parse.urlencode(
             {"list": src["list_uri"], "limit": src["member_page_limit"]}
-            | ({"cursor": cursor} if cursor else {}))
+            | ({"cursor": cursor} if cursor else {})
+        )
         d = rpc(appview, f"app.bsky.graph.getList?{q}", token=token)
         members.extend(d.get("items", []))
         cursor = d.get("cursor")
         if not cursor:
             break
-    if owner_did and not any((m.get("subject") or {}).get("did") == owner_did
-                             for m in members):
+    if owner_did and not any(
+        (m.get("subject") or {}).get("did") == owner_did for m in members
+    ):
         members.append({"subject": {"did": owner_did}})  # always scan owner too
 
     def member_posts(m):
@@ -233,12 +253,17 @@ def refresh():
         if not did:
             return []
         try:
-            q = urllib.parse.urlencode({"actor": did, "limit": src["author_feed_limit"]})
+            q = urllib.parse.urlencode(
+                {"actor": did, "limit": src["author_feed_limit"]}
+            )
             d = rpc(appview, f"app.bsky.feed.getAuthorFeed?{q}", token=token)
         except RuntimeError:
             return []
-        return [i["post"] for i in d.get("feed", [])
-                if src["include_reposts"] or "reason" not in i]
+        return [
+            i["post"]
+            for i in d.get("feed", [])
+            if src["include_reposts"] or "reason" not in i
+        ]
 
     posts = []
     with ThreadPoolExecutor(max_workers=src["max_workers"]) as ex:
@@ -261,12 +286,20 @@ def refresh_loop():
         try:
             picks, scanned, members = refresh()
             with CACHE_LOCK:
-                CACHE.update(feeds=picks, updated=time.time(),
-                             scanned=scanned, members=members, error=None)
+                CACHE.update(
+                    feeds=picks,
+                    updated=time.time(),
+                    scanned=scanned,
+                    members=members,
+                    error=None,
+                )
                 state_uris = sum(len(v) for v in _state["seen"].values())
                 CACHE["state_uris"] = state_uris
             total = sum(len(v) for v in picks.values())
-            print(f"[feedgen] refresh ok: {total} picks / {scanned} scanned / state_uris={state_uris}", flush=True)
+            print(
+                f"[feedgen] refresh ok: {total} picks / {scanned} scanned / state_uris={state_uris}",
+                flush=True,
+            )
         except Exception as e:
             with CACHE_LOCK:
                 CACHE["error"] = f"{type(e).__name__}: {e}"[:300]
@@ -292,18 +325,31 @@ class Handler(BaseHTTPRequestHandler):
         u = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(u.query)
         if u.path == "/.well-known/did.json":
-            return self._send(200, {
-                "@context": ["https://www.w3.org/ns/did/v1"],
-                "id": SERVICE_DID,
-                "service": [{"id": "#bsky_fg", "type": "BskyFeedGenerator",
-                             "serviceEndpoint": f"https://{HOSTNAME}"}]})
+            return self._send(
+                200,
+                {
+                    "@context": ["https://www.w3.org/ns/did/v1"],
+                    "id": SERVICE_DID,
+                    "service": [
+                        {
+                            "id": "#bsky_fg",
+                            "type": "BskyFeedGenerator",
+                            "serviceEndpoint": f"https://{HOSTNAME}",
+                        }
+                    ],
+                },
+            )
         if u.path == "/xrpc/app.bsky.feed.describeFeedGenerator":
-            return self._send(200, {"did": SERVICE_DID,
-                                    "feeds": [{"uri": uri} for uri in FEEDS]})
+            return self._send(
+                200,
+                {"did": SERVICE_DID, "feeds": [{"uri": uri} for uri in FEEDS]},
+            )
         if u.path == "/xrpc/app.bsky.feed.getFeedSkeleton":
             uri = q.get("feed", [None])[0]
             if uri not in FEEDS:
-                return self._send(400, {"error": "UnknownFeed", "message": "unknown feed"})
+                return self._send(
+                    400, {"error": "UnknownFeed", "message": "unknown feed"}
+                )
             try:
                 limit = max(1, min(100, int(q.get("limit", ["50"])[0])))
             except ValueError:
@@ -314,26 +360,40 @@ class Handler(BaseHTTPRequestHandler):
                 offset = 0
             with CACHE_LOCK:
                 picks = list(CACHE["feeds"].get(FEEDS[uri]["rkey"], []))
-            page = picks[offset:offset + limit]
+            page = picks[offset : offset + limit]
             out = {"feed": [{"post": p} for p in page]}
             if offset + limit < len(picks):
                 out["cursor"] = str(offset + limit)
-            return self._send(200, out, headers={
-                "Cache-Control": "no-store, no-cache, must-revalidate",
-                "Pragma": "no-cache",
-            })
+            return self._send(
+                200,
+                out,
+                headers={
+                    "Cache-Control": "no-store, no-cache, must-revalidate",
+                    "Pragma": "no-cache",
+                },
+            )
         if u.path in ("/", "/health"):
             with CACHE_LOCK:
-                snap = {k: (v if k != "feeds" else {rk: list(posts) for rk, posts in v.items()}) for k, v in CACHE.items()}
+                snap = {
+                    k: (
+                        v
+                        if k != "feeds"
+                        else {rk: list(posts) for rk, posts in v.items()}
+                    )
+                    for k, v in CACHE.items()
+                }
             rows = "".join(
                 f"<li><code>{f['rkey']}</code> ({f['display_name']}): "
                 f"{len(snap['feeds'].get(f['rkey'], []))} posts</li>"
-                for f in CFG["feeds"])
+                for f in CFG["feeds"]
+            )
 
-            html = (f"<h1>Leftist top-posts feeds</h1><ul>{rows}</ul>"
-                    f"<p>scanned={snap['scanned']} members={snap['members']} "
-                    f"updated={snap['updated']:.0f} error={snap['error']}</p>"
-                    f"<p>state_uris={snap.get('state_uris','?')}</p>").encode()
+            html = (
+                f"<h1>Leftist top-posts feeds</h1><ul>{rows}</ul>"
+                f"<p>scanned={snap['scanned']} members={snap['members']} "
+                f"updated={snap['updated']:.0f} error={snap['error']}</p>"
+                f"<p>state_uris={snap.get('state_uris', '?')}</p>"
+            ).encode()
             return self._send(200, html, "text/html")
         return self._send(404, {"error": "NotFound"})
 
@@ -346,12 +406,17 @@ if __name__ == "__main__":
     print("[feedgen] warming cache (first refresh)...", flush=True)
     try:
         picks, scanned, members = refresh()
-        CACHE.update(feeds=picks, updated=time.time(),
-                     scanned=scanned, members=members)
+        CACHE.update(feeds=picks, updated=time.time(), scanned=scanned, members=members)
         save_state()
-        print(f"[feedgen] warm ok: {sum(len(v) for v in picks.values())} picks", flush=True)
+        print(
+            f"[feedgen] warm ok: {sum(len(v) for v in picks.values())} picks",
+            flush=True,
+        )
     except Exception as e:
         CACHE["error"] = f"warm failed: {e}"[:300]
-        print(f"[feedgen] warm failed (serving empty until refresh): {e}", flush=True)
+        print(
+            f"[feedgen] warm failed (serving empty until refresh): {e}",
+            flush=True,
+        )
     threading.Thread(target=refresh_loop, daemon=True).start()
     HTTPServer(("127.0.0.1", CFG.get("port", 8004)), Handler).serve_forever()
