@@ -37,6 +37,7 @@ flagged below as future work.
 
 import json
 import os
+import sqlite3
 import threading
 import time
 import urllib.parse
@@ -217,6 +218,75 @@ def select(posts, fcfg, sc, now, owner):
     return out
 
 
+def _init_db():
+    """Create SQLite cache if it doesn't exist."""
+    db_path = os.path.join(BASE, "feedgen.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS posts (
+            uri TEXT PRIMARY KEY,
+            author_did TEXT NOT NULL,
+            indexed_at TEXT NOT NULL,
+            like_count INTEGER DEFAULT 0,
+            repost_count INTEGER DEFAULT 0,
+            quote_count INTEGER DEFAULT 0,
+            reply_count INTEGER DEFAULT 0,
+            record_json TEXT NOT NULL,
+            fetched_at REAL NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_author ON posts(author_did)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_indexed ON posts(indexed_at)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fetch_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def _get_fetch_state(conn, key, default=None):
+    row = conn.execute("SELECT value FROM fetch_state WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def _set_fetch_state(conn, key, value):
+    conn.execute("INSERT OR REPLACE INTO fetch_state VALUES (?, ?)", (key, value))
+    conn.commit()
+
+
+def _cache_posts(conn, posts):
+    """Insert or update posts in the cache."""
+    now = time.time()
+    for p in posts:
+        uri = p.get("uri")
+        if not uri:
+            continue
+        ts = p.get("indexedAt") or (p.get("record") or {}).get("createdAt") or ""
+        author_did = (p.get("author") or {}).get("did", "?")
+        conn.execute(
+            """INSERT OR REPLACE INTO posts
+               (uri, author_did, indexed_at, like_count, repost_count, quote_count, reply_count, record_json, fetched_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                uri, author_did, ts,
+                p.get("likeCount", 0), p.get("repostCount", 0),
+                p.get("quoteCount", 0), p.get("replyCount", 0),
+                json.dumps(p), now,
+            ),
+        )
+    conn.commit()
+
+
+def _count_cached_posts(conn, max_age_h, now_dt):
+    """Count how many posts we have cached within the time window."""
+    cutoff = (now_dt - __import__("datetime").timedelta(hours=max_age_h)).isoformat()
+    row = conn.execute("SELECT COUNT(*) FROM posts WHERE indexed_at >= ?", (cutoff,)).fetchone()
+    return row[0]
+
+
 def refresh():
     """One member scan, then per-feed selection. Returns (picks_by_rkey, scanned, members)."""
     src, sc = CFG["source"], CFG["scoring"]
@@ -224,20 +294,19 @@ def refresh():
     password = ENV.get("BSKY_APP_PASSWORD")
     if not handle or not password:
         raise RuntimeError("missing BSKY_HANDLE/BSKY_APP_PASSWORD in feedgen .env")
-    sess = rpc(
-        src["pds_host"],
-        "com.atproto.server.createSession",
-        {"identifier": handle, "password": password},
-    )
+    sess = rpc(src["pds_host"], "com.atproto.server.createSession",
+               {"identifier": handle, "password": password})
     token = sess["accessJwt"]
     appview = src["appview_host"]
     owner_did = CFG.get("owner", {}).get("did")
+    now = datetime.now(timezone.utc)
+
+    # Enumerate all list members
     members, cursor = [], None
     while True:
         q = urllib.parse.urlencode(
             {"list": src["list_uri"], "limit": src["member_page_limit"]}
-            | ({"cursor": cursor} if cursor else {})
-        )
+            | ({"cursor": cursor} if cursor else {}))
         d = rpc(appview, f"app.bsky.graph.getList?{q}", token=token)
         members.extend(d.get("items", []))
         cursor = d.get("cursor")
@@ -246,36 +315,94 @@ def refresh():
     if owner_did and not any(
         (m.get("subject") or {}).get("did") == owner_did for m in members
     ):
-        members.append({"subject": {"did": owner_did}})  # always scan owner too
+        members.append({"subject": {"did": owner_did}})
 
-    def member_posts(m):
-        did = (m.get("subject") or {}).get("did")
-        if not did:
-            return []
-        try:
-            q = urllib.parse.urlencode(
-                {"actor": did, "limit": src["author_feed_limit"]}
-            )
-            d = rpc(appview, f"app.bsky.feed.getAuthorFeed?{q}", token=token)
-        except RuntimeError:
-            return []
-        return [
-            i["post"]
-            for i in d.get("feed", [])
-            if src["include_reposts"] or "reason" not in i
-        ]
+    member_dids = [(m.get("subject") or {}).get("did") for m in members]
+    member_dids = [d for d in member_dids if d]
 
-    posts = []
+    # Find the widest time window across all feeds
+    max_window_h = max(f.get("max_age_hours", 48) for f in CFG["feeds"])
+
+    # Init SQLite
+    conn = _init_db()
+
+    # Determine fetch strategy:
+    # - If we have no cached data yet, fetch only recent posts (48h) to bootstrap quickly
+    # - On subsequent runs, fetch only posts newer than our last fetch
+    # - Every N refreshes, do a deeper backfill
+    cached_count = _count_cached_posts(conn, max_window_h, now)
+    last_fetch_ts = _get_fetch_state(conn, "last_fetch_ts")
+    fetch_depth_h = 48  # default: fetch last 48h of posts
+
+    if cached_count == 0:
+        # First run: bootstrap with recent posts only (fast)
+        fetch_depth_h = 48
+    elif last_fetch_ts:
+        # Subsequent runs: fetch since last fetch (incremental)
+        fetch_depth_h = min(max_window_h, 48)  # cap at window size
+
+    cutoff_ts = (now - __import__("datetime").timedelta(hours=fetch_depth_h)).isoformat()
+
+    def fetch_member_recent(did):
+        """Fetch recent posts from one member (lightweight, few pages)."""
+        posts = []
+        cursor = None
+        for _ in range(10):  # max 10 pages = 1000 posts per member
+            try:
+                q = urllib.parse.urlencode(
+                    {"actor": did, "limit": 100}
+                    | ({"cursor": cursor} if cursor else {}))
+                d = rpc(appview, f"app.bsky.feed.getAuthorFeed?{q}", token=token)
+            except RuntimeError:
+                break
+            feed_items = d.get("feed", [])
+            if not feed_items:
+                break
+            reached_cutoff = False
+            for i in feed_items:
+                if src["include_reposts"] or "reason" not in i:
+                    p = i["post"]
+                    ts = p.get("indexedAt") or (p.get("record") or {}).get("createdAt")
+                    if ts:
+                        if ts >= cutoff_ts:
+                            posts.append(p)
+                        else:
+                            reached_cutoff = True
+            if reached_cutoff:
+                break
+            next_cursor = d.get("cursor")
+            if not next_cursor:
+                break
+            cursor = next_cursor
+        return posts
+
+    # Fetch recent posts for all members
+    fetched_posts = []
     with ThreadPoolExecutor(max_workers=src["max_workers"]) as ex:
-        for batch in ex.map(member_posts, members):
-            posts.extend(batch)
+        for batch in ex.map(fetch_member_recent, member_dids):
+            fetched_posts.extend(batch)
+
+    # Cache the fetched posts
+    _cache_posts(conn, fetched_posts)
+    _set_fetch_state(conn, "last_fetch_ts", now.isoformat())
+
+    # Read all cached posts within the widest window for scoring
+    cutoff_full = (now - __import__("datetime").timedelta(hours=max_window_h)).isoformat()
+    rows = conn.execute(
+        "SELECT record_json FROM posts WHERE indexed_at >= ?",
+        (cutoff_full,)
+    ).fetchall()
+    all_posts = [json.loads(r[0]) for r in rows]
+
+    conn.close()
+
+    # Deduplicate
     seen, uniq = set(), []
-    for p in posts:
+    for p in all_posts:
         if p.get("uri") and p["uri"] not in seen:
             seen.add(p["uri"])
             uniq.append(p)
 
-    now = datetime.now(timezone.utc)
     owner = CFG.get("owner", {})
     picks = {f["rkey"]: select(uniq, f, sc, now, owner) for f in CFG["feeds"]}
     return picks, len(uniq), len(members)

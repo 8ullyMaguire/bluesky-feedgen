@@ -66,7 +66,7 @@
     {"rkey": "leftist-trending",
      "display_name": "Leftist Trending",
      "description": "Lo que sube más rápido en la lista Leftist: likes+reposts+quotes+replies por hora desde su publicación. Requiere que al menos un tercio de quienes lo likan lo compartan.",
-     "min_age_hours": 0.2, "max_age_hours": 48,
+     "min_age_hours": 0.2, "max_age_hours": 720,
      "min_score": 0, "min_likes": 5, "min_reposts_share": 0.33,
      "max_per_author": 2, "max_posts": 100, "ranking": "trending"}
   ]
