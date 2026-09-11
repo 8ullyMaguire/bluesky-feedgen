@@ -160,6 +160,21 @@ def extract_candidates(record, text_only=False):
     return found
 
 
+def resolve_many(handles, workers=8):
+    """Resolve handles -> DIDs concurrently. Serial resolution of ~1k handles is
+    the slowest part of a backfill and also matters for the 4-hourly timer."""
+    import concurrent.futures
+    out = {}
+    uniq = sorted({h for h in handles if h})
+    if not uniq:
+        return out
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        for h, did in zip(uniq, ex.map(resolve_handle, uniq)):
+            if did:
+                out[h] = did
+    return out
+
+
 def scan_promoter(did, token, collection, max_pages=200):
     """All records of one collection for a repo (paginated listRecords)."""
     out, cursor, pages = [], None, 0
@@ -236,8 +251,10 @@ def record(con, did, handle, promoter, ptype, evidence, status, rkey=None, added
            VALUES(?,?,?,?,?,?,?,?,?)
            ON CONFLICT(did) DO UPDATE SET
              handle=COALESCE(excluded.handle, promotions.handle),
-             status=CASE WHEN excluded.status='added' THEN 'added'
-                         ELSE promotions.status END,
+             status=CASE
+               WHEN excluded.status='added'  THEN 'added'
+               WHEN excluded.status='failed' THEN 'failed'
+               ELSE promotions.status END,
              added_at=COALESCE(excluded.added_at, promotions.added_at),
              listitem_rkey=COALESCE(excluded.listitem_rkey, promotions.listitem_rkey),
              evidence_uri=COALESCE(promotions.evidence_uri, excluded.evidence_uri)""",
@@ -299,9 +316,12 @@ def run(argv):
         posts = scan_promoter(pdid, token, "app.bsky.feed.post")
         reps = scan_promoter(pdid, token, "app.bsky.feed.repost")
         if not backfill:
-            # incremental: only items we have not recorded evidence for yet
+            # incremental: skip items whose promotion was *successfully* added.
+            # Failures (and dry runs) are deliberately re-scanned so a transient
+            # 502 self-heals on the next tick instead of being lost forever.
             known = {r["evidence_uri"] for r in con.execute(
-                "SELECT evidence_uri FROM promotions WHERE evidence_uri IS NOT NULL")}
+                "SELECT evidence_uri FROM promotions "
+                "WHERE status='added' AND evidence_uri IS NOT NULL")}
             posts = [r for r in posts if r.get("uri") not in known]
             reps = [r for r in reps if r.get("uri") not in known]
         print(f"[listupd] {phandle}: {len(posts)} posts, {len(reps)} reposts "
@@ -317,29 +337,41 @@ def run(argv):
             if did:
                 found.setdefault(did, (None, phandle, "repost", r.get("uri")))
 
-    # resolve handle-keys to DIDs
+    # resolve handle-keys to DIDs (concurrently — this is the slow step)
+    handle_keys = [k for k in found if not k.startswith("did:")]
+    resolved_dids = resolve_many(handle_keys)
+    print(f"[listupd] resolved {len(resolved_dids)}/{len(handle_keys)} handles",
+          flush=True)
     resolved = {}
     for key, (_, promoter, ptype, evidence) in found.items():
-        did, h = key, None
-        if not key.startswith("did:"):
-            did = resolve_handle(key)
-            h = key
-            if not did:
-                continue
-            time.sleep(0.05)
-        resolved.setdefault(did, (h, promoter, ptype, evidence))
+        if key.startswith("did:"):
+            resolved.setdefault(key, (None, promoter, ptype, evidence))
+            continue
+        did = resolved_dids.get(key)
+        if did:
+            resolved.setdefault(did, (key, promoter, ptype, evidence))
 
     print(f"[listupd] distinct promoted accounts discovered: {len(resolved)}", flush=True)
 
-    to_add = []
-    for did, (h, promoter, ptype, evidence) in resolved.items():
-        if did in cur_dids or did == LIST_OWNER_DID or did in promoters.values():
-            continue
-        ok, real_handle = account_exists(token, did)
+    # filter down to accounts that are not already members / are alive.
+    # account_exists hits the network, so do it concurrently.
+    import concurrent.futures
+    candidates = [(did, h, promoter, ptype, evidence)
+                  for did, (h, promoter, ptype, evidence) in resolved.items()
+                  if did not in cur_dids and did != LIST_OWNER_DID
+                  and did not in promoters.values()]
+    to_add, inactive = [], 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        alive = list(ex.map(lambda c: account_exists(token, c[0]), candidates))
+    for cand, (ok, real_handle) in zip(candidates, alive):
+        did, h, promoter, ptype, evidence = cand
         if not ok:
             record(con, did, h, promoter, ptype, evidence, "skipped-inactive")
+            inactive += 1
             continue
         to_add.append((did, real_handle or h, promoter, ptype, evidence))
+
+    print(f"[listupd] skipped {inactive} inactive/unknown accounts", flush=True)
 
     print(f"[listupd] to add: {len(to_add)} (dry_run={dry})", flush=True)
     added = 0
