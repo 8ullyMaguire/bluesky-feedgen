@@ -115,6 +115,27 @@ CREATE TABLE IF NOT EXISTS bot_runs (
     note       TEXT
 );
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS repost_cycle (
+    uri     TEXT PRIMARY KEY,
+    last_at REAL,
+    rkey    TEXT,
+    cycles  INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS cycles (
+    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    uri    TEXT NOT NULL,
+    at     REAL NOT NULL,
+    action TEXT NOT NULL,
+    rkey   TEXT,
+    status TEXT,
+    detail TEXT
+);
+CREATE TABLE IF NOT EXISTS saved_log (
+    uri    TEXT PRIMARY KEY,
+    at     REAL,
+    status TEXT,
+    detail TEXT
+);
 """
 
 
@@ -483,7 +504,272 @@ def act(con, token, did_self, kind, rows, mode_cfg, dry, max_per_run):
 
 
 # --------------------------------------------------------------------------
-# main
+# pinned "keep circulating" reposts (repost_cycle)
+# --------------------------------------------------------------------------
+
+def fetch_post_refs(token, uris):
+    """Fresh {uri: cid} for a set of posts.
+
+    A repost's subject needs the *current* cid, so it is re-fetched every cycle
+    rather than stored once.
+    """
+    out = {}
+    uris = [u for u in uris if u]
+    for i in range(0, len(uris), 25):
+        chunk = uris[i:i + 25]
+        try:
+            q = urllib.parse.urlencode([("uris", u) for u in chunk])
+            d = rpc(APPVIEW, f"app.bsky.feed.getPosts?{q}", token=token, timeout=30)
+            for p in d.get("posts", []):
+                if p.get("uri") and p.get("cid"):
+                    out[p["uri"]] = {"cid": p["cid"],
+                                     "handle": (p.get("author") or {}).get("handle"),
+                                     "text": ((p.get("record") or {}).get("text") or "")[:90]}
+        except Exception as e:
+            print(f"[bot] getPosts failed for {len(chunk)} uris: {e}", flush=True)
+    return out
+
+
+def unrepost(token, did_self, rkey):
+    """Delete our own repost record. Best effort: a missing record is fine."""
+    try:
+        rpc(PDS, "com.atproto.repo.deleteRecord", {
+            "repo": did_self, "collection": "app.bsky.feed.repost", "rkey": rkey},
+            token)
+        return True, ""
+    except Exception as e:
+        return False, str(e)[:160]
+
+
+def make_repost(token, did_self, uri, cid):
+    now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    res = rpc(PDS, "com.atproto.repo.createRecord", {
+        "repo": did_self, "collection": "app.bsky.feed.repost",
+        "record": {"$type": "app.bsky.feed.repost",
+                   "subject": {"uri": uri, "cid": cid},
+                   "createdAt": now_iso}}, token)
+    new_uri = res.get("uri", "")
+    return new_uri.rsplit("/", 1)[-1] if new_uri else None
+
+
+def do_repost_cycle(con, token, did_self, mc, args):
+    """Re-repost each pinned post once per interval_hours, inside the window."""
+    dry = bool(mc.get("dry_run", True))
+    if "--dry-run" in args:
+        dry = True
+    if "--live" in args:
+        dry = False
+    now = datetime.now()
+    start, end = window_bounds(mc, now)
+    posts = mc.get("posts") or []
+    interval = float(mc.get("interval_hours", 4)) * 3600
+    in_window = start <= now <= end
+    print(f"[bot] repost_cycle: {len(posts)} pinned, interval={mc.get('interval_hours')}h "
+          f"window {start:%H:%M}-{end:%H:%M} in_window={in_window} dry={dry}",
+          flush=True)
+    if not in_window:
+        con.execute("INSERT INTO bot_runs(mode,started,finished,candidates,acted,"
+                    "dry_run,note) VALUES(?,?,?,?,?,?,?)",
+                    ("repost_cycle", time.time(), time.time(), len(posts), 0,
+                     int(dry), "outside window"))
+        return []
+
+    refs = fetch_post_refs(token, posts)
+    missing = [u for u in posts if u not in refs]
+    for u in missing:
+        # a deleted or unfindable pinned post must be reported, not retried forever
+        con.execute("INSERT INTO cycles(uri,at,action,rkey,status,detail) "
+                    "VALUES(?,?,?,?,?,?)", (u, time.time(), "skip", None, "missing",
+                                            "getPosts returned nothing"))
+    if missing:
+        print(f"[bot] repost_cycle: {len(missing)} pinned post(s) could not be "
+              f"fetched: {missing}", flush=True)
+
+    due = []
+    for uri in posts:
+        if uri not in refs:
+            continue
+        row = con.execute("SELECT last_at FROM repost_cycle WHERE uri=?",
+                          (uri,)).fetchone()
+        last = row["last_at"] if row else None
+        if last is None or (time.time() - last) >= interval:
+            due.append(uri)
+    due = due[:int(mc.get("max_per_run", len(posts)) or len(posts))]
+    print(f"[bot] repost_cycle: {len(due)} due", flush=True)
+
+    lines, acted = [], 0
+    for uri in due:
+        info = refs[uri]
+        row = con.execute("SELECT rkey FROM repost_cycle WHERE uri=?",
+                          (uri,)).fetchone()
+        old_rkey = row["rkey"] if row else None
+        label = f"@{info['handle']} :: {info['text'][:70]}"
+        if dry:
+            lines.append(f"DRY cycle repost {uri.rsplit('/', 1)[-1]} {label}")
+            continue
+        # Create first, delete the previous one only after the create succeeds:
+        # if the create fails the post stays reposted rather than dropping out.
+        try:
+            new_rkey = make_repost(token, did_self, uri, info["cid"])
+        except Exception as e:
+            con.execute("INSERT INTO cycles(uri,at,action,rkey,status,detail) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (uri, time.time(), "create", None, "fail", str(e)[:160]))
+            lines.append(f"ERR cycle repost {uri.rsplit('/', 1)[-1]}: {e}")
+            continue
+        con.execute("INSERT INTO cycles(uri,at,action,rkey,status,detail) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (uri, time.time(), "create", new_rkey, "ok", label))
+        if mc.get("mode", "refresh") == "refresh" and old_rkey and old_rkey != new_rkey:
+            ok, err = unrepost(token, did_self, old_rkey)
+            con.execute("INSERT INTO cycles(uri,at,action,rkey,status,detail) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (uri, time.time(), "delete", old_rkey,
+                         "ok" if ok else "fail", err))
+        con.execute(
+            "INSERT INTO repost_cycle(uri,last_at,rkey,cycles) VALUES(?,?,?,1) "
+            "ON CONFLICT(uri) DO UPDATE SET last_at=excluded.last_at, "
+            "rkey=excluded.rkey, cycles=repost_cycle.cycles+1",
+            (uri, time.time(), new_rkey))
+        acted += 1
+        lines.append(f"OK  cycle repost {uri.rsplit('/', 1)[-1]} {label}")
+        time.sleep(0.5)
+
+    con.execute("INSERT INTO bot_runs(mode,started,finished,candidates,acted,"
+                "dry_run,note) VALUES(?,?,?,?,?,?,?)",
+                ("repost_cycle", time.time(), time.time(), len(posts), acted,
+                 int(dry), "due=%d" % len(due)))
+    return lines
+
+
+# --------------------------------------------------------------------------
+# random reposts from the account's own bookmarks (saved_reposts)
+# --------------------------------------------------------------------------
+
+def fetch_bookmarks(token, max_pages=10):
+    out, cursor, pages = [], None, 0
+    while pages < max_pages:
+        p = {"limit": 100}
+        if cursor:
+            p["cursor"] = cursor
+        try:
+            d = rpc(PDS, "app.bsky.bookmark.getBookmarks?"
+                    + urllib.parse.urlencode(p), token=token, timeout=45)
+        except RuntimeError as e:
+            print(f"[bot] bookmarks unavailable: {e}", flush=True)
+            break
+        items = d.get("bookmarks") or []
+        if not items:
+            break
+        for b in items:
+            subj = b.get("subject") or {}
+            it = b.get("item") or {}
+            uri = subj.get("uri") or it.get("uri")
+            cid = subj.get("cid") or it.get("cid")
+            if uri and cid and not str(it.get("$type", "")).endswith("notFound"):
+                out.append({"uri": uri, "cid": cid,
+                            "handle": (it.get("author") or {}).get("handle"),
+                            "text": ((it.get("record") or {}).get("text") or "")[:90]})
+        cursor = d.get("cursor")
+        pages += 1
+        if not cursor:
+            break
+    return out
+
+
+def do_saved_reposts(con, token, did_self, mc, args):
+    """Repost `per_day` random bookmarked posts, spread across the window."""
+    import random
+    dry = bool(mc.get("dry_run", True))
+    if "--dry-run" in args:
+        dry = True
+    if "--live" in args:
+        dry = False
+    now = datetime.now()
+    start, end = window_bounds(mc, now)
+    per_day = int(mc.get("per_day", 3) or 0)
+    in_window = start <= now <= end
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    done_today = con.execute(
+        "SELECT COUNT(*) c FROM saved_log WHERE status='ok' AND at>=?",
+        (day_start,)).fetchone()["c"]
+    # spread the day's quota across the window instead of dumping it at 08:00
+    window_h = max((end - start).total_seconds() / 3600.0, 0.01)
+    elapsed_h = max((now - start).total_seconds() / 3600.0, 0.0)
+    target = int(per_day * min(elapsed_h / window_h, 1.0)) if in_window else 0
+    due = max(0, min(target - done_today, int(mc.get("max_per_run", 1))))
+    print(f"[bot] saved_reposts: {done_today}/{per_day} done today, target={target} "
+          f"due={due} in_window={in_window} dry={dry}", flush=True)
+    if not in_window or due <= 0 or per_day <= 0:
+        con.execute("INSERT INTO bot_runs(mode,started,finished,candidates,acted,"
+                    "dry_run,note) VALUES(?,?,?,?,?,?,?)",
+                    ("saved_reposts", time.time(), time.time(), 0, 0, int(dry),
+                     "nothing due"))
+        return []
+
+    bookmarks = fetch_bookmarks(token)
+    pinned = set((ACT.get("repost_cycle") or {}).get("posts") or [])
+    exclude_pinned = mc.get("exclude_pinned", True)
+    already = {r["uri"] for r in con.execute("SELECT uri FROM saved_log")}
+    acted_uris = {r["uri"] for r in con.execute(
+        "SELECT uri FROM actions WHERE kind LIKE 'repost%' AND status='ok'")}
+    own_reposts = own_repost_subjects(token)
+
+    pool = []
+    for b in bookmarks:
+        uri = b["uri"]
+        if uri in already or uri in acted_uris or uri in own_reposts:
+            continue
+        if exclude_pinned and uri in pinned:
+            continue
+        if b.get("handle") is None:
+            continue
+        pool.append(b)
+    print(f"[bot] saved_reposts: {len(bookmarks)} bookmarks, {len(pool)} eligible",
+          flush=True)
+    if not pool:
+        con.execute("INSERT INTO bot_runs(mode,started,finished,candidates,acted,"
+                    "dry_run,note) VALUES(?,?,?,?,?,?,?)",
+                    ("saved_reposts", time.time(), time.time(), 0, 0, int(dry),
+                     "pool empty"))
+        return []
+
+    picks = random.sample(pool, min(due, len(pool)))
+    lines, acted = [], 0
+    for b in picks:
+        label = f"@{b['handle']} :: {b['text'][:70]}"
+        if dry:
+            lines.append(f"DRY saved repost {b['uri'].rsplit('/', 1)[-1]} {label}")
+            continue
+        try:
+            fresh = fetch_post_refs(token, [b["uri"]]).get(b["uri"])
+            if not fresh:
+                con.execute("INSERT INTO saved_log(uri,at,status,detail) "
+                            "VALUES(?,?,?,?)", (b["uri"], time.time(), "missing",
+                                                "getPosts returned nothing"))
+                continue
+            rkey = make_repost(token, did_self, b["uri"], fresh["cid"])
+            con.execute("INSERT INTO saved_log(uri,at,status,detail) "
+                        "VALUES(?,?,?,?)", (b["uri"], time.time(), "ok", rkey or ""))
+            acted += 1
+            lines.append(f"OK  saved repost {b['uri'].rsplit('/', 1)[-1]} {label}")
+        except Exception as e:
+            con.execute("INSERT INTO saved_log(uri,at,status,detail) "
+                        "VALUES(?,?,?,?) ON CONFLICT(uri) DO UPDATE SET "
+                        "at=excluded.at, status=excluded.status, detail=excluded.detail",
+                        (b["uri"], time.time(), "fail", str(e)[:160]))
+            lines.append(f"ERR saved repost {b['uri'].rsplit('/', 1)[-1]}: {e}")
+        time.sleep(0.5)
+
+    con.execute("INSERT INTO bot_runs(mode,started,finished,candidates,acted,"
+                "dry_run,note) VALUES(?,?,?,?,?,?,?)",
+                ("saved_reposts", time.time(), time.time(), len(pool), acted,
+                 int(dry), "due=%d" % due))
+    return lines
+
+
+# --------------------------------------------------------------------------
+# report / main
 # --------------------------------------------------------------------------
 
 def show_report(lines=25):
@@ -496,6 +782,24 @@ def show_report(lines=25):
     print("=== counts by kind/status ===")
     for r in con.execute("SELECT kind,status,COUNT(*) c FROM actions GROUP BY kind,status"):
         print(f"  {r['kind']:<11} {r['status']:<5} {r['c']}")
+    print("=== pinned repost cycle ===")
+    for r in con.execute("SELECT uri, cycles, datetime(last_at,'unixepoch','localtime') t, "
+                         "rkey FROM repost_cycle ORDER BY last_at"):
+        print(f"  {r['uri'].rsplit('/',1)[-1]:<14} cycles={r['cycles']:<3} last={r['t']}")
+    print("=== saved-post reposts ===")
+    for r in con.execute("SELECT uri, status, datetime(at,'unixepoch','localtime') t "
+                         "FROM saved_log ORDER BY at DESC LIMIT 10"):
+        print(f"  {r['t']} {r['status']:<8} {r['uri'].rsplit('/',1)[-1]}")
+    n_saved_today = con.execute(
+        "SELECT COUNT(*) c FROM saved_log WHERE status='ok' AND at>=?",
+        (datetime.now().replace(hour=0, minute=0, second=0,
+                                microsecond=0).timestamp(),)).fetchone()["c"]
+    print(f"  saved reposts today: {n_saved_today}"
+          f"/{(ACT.get('saved_reposts') or {}).get('per_day', '?')}")
+    print("=== recent cycle log ===")
+    for r in con.execute("SELECT datetime(at,'unixepoch','localtime') t, action, status, "
+                         "substr(detail,1,50) d FROM cycles ORDER BY id DESC LIMIT 8"):
+        print(f"  {r['t']} {r['action']:<7} {r['status']:<5} {r['d']}")
     if os.path.exists(REPORT):
         print(f"\nfull report: {REPORT}")
     return 0
@@ -540,6 +844,21 @@ def main(argv):
         print(f"[bot] follow refresh error: {e}", flush=True)
 
     all_lines = []
+    # pinned "keep circulating" reposts and random saved-post reposts run first:
+    # they are explicit instructions, not best-effort picks from the follow graph.
+    for name, fn in (("repost_cycle", do_repost_cycle),
+                     ("saved_reposts", do_saved_reposts)):
+        mc = ACT.get(name) or {}
+        if not mc.get("enabled"):
+            continue
+        if only and only not in (name, "repost", "all"):
+            continue
+        try:
+            all_lines.extend(fn(con, token, did_self, mc, args))
+        except Exception as e:
+            print(f"[bot] {name} failed: {e}", flush=True)
+            all_lines.append(f"ERR {name}: {e}")
+
     for kind in ("repost", "like"):
         mc = ACT.get(kind) or {}
         if not mc.get("enabled"):

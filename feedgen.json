@@ -317,6 +317,36 @@
       "skip_reposts": true,
       "skip_sensitive": true,
       "langs": null
+    },
+
+    "repost_cycle": {
+      "_note": "Keep specific posts circulating: re-repost each one every interval_hours inside the window. mode=refresh deletes our previous repost first, so the post carries a fresh repost timestamp instead of accumulating duplicate repost records.",
+      "enabled": true,
+      "dry_run": false,
+      "interval_hours": 4,
+      "window_start_hour": 8,
+      "window_end_hour": 24,
+      "max_per_run": 4,
+      "mode": "refresh",
+      "posts": [
+        "at://did:plc:bnjxoctfnukack6evxsbexc4/app.bsky.feed.post/3mujn4bxbqc2a",
+        "at://did:plc:bnjxoctfnukack6evxsbexc4/app.bsky.feed.post/3muafc5eaxk2h",
+        "at://did:plc:bnjxoctfnukack6evxsbexc4/app.bsky.feed.post/3mvabpfeg522l",
+        "at://did:plc:bnjxoctfnukack6evxsbexc4/app.bsky.feed.post/3mujtc7oacc2a"
+      ]
+    },
+
+    "saved_reposts": {
+      "_note": "Repost a few random posts from the account's own bookmarks each day, spread across the window. Pinned posts are excluded so the two features never fight over the same post.",
+      "enabled": true,
+      "dry_run": false,
+      "per_day": 3,
+      "window_start_hour": 8,
+      "window_end_hour": 24,
+      "max_per_run": 1,
+      "min_age_hours": 1,
+      "exclude_pinned": true,
+      "skip_own_posts": false
     }
   }
 }
