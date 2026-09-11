@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the Leftist list updater every 4 hours
+
+[Timer]
+OnCalendar=*-*-* 00/4:20:00
+AccuracySec=2min
+Persistent=true
+Unit=list-updater.service
+
+[Install]
+WantedBy=timers.target

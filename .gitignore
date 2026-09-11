@@ -1,3 +1,10 @@
 __pycache__/
 *.pyc
-diag_*.py
+feedgen.sqlite
+feedgen.sqlite-wal
+feedgen.sqlite-shm
+feedgen.db
+feedgen-state.json
+feedgen-state.json.migrated
+actions-report.md
+.env

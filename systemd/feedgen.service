@@ -1,0 +1,16 @@
+[Unit]
+Description=Leftist top-posts Bluesky feed generator
+Documentation=https://leftist.polarisocial.xyz
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/home/alvaro/feedgen
+ExecStart=/usr/bin/python3 /home/alvaro/feedgen/feedgen.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

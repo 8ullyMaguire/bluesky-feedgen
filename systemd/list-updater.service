@@ -1,0 +1,12 @@
+[Unit]
+Description=Sync the Leftist list with promoter accounts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/alvaro/feedgen
+ExecStart=/usr/bin/python3 /home/alvaro/feedgen/list-updater.py
+TimeoutStartSec=1800
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,12 @@
+[Unit]
+Description=Bluesky action bot (auto-repost / auto-like) — leftist setup
+After=network-online.target feedgen.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/alvaro/feedgen
+ExecStart=/usr/bin/python3 /home/alvaro/feedgen/action-bot.py
+TimeoutStartSec=900
+StandardOutput=journal
+StandardError=journal
