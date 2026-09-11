@@ -275,6 +275,35 @@
       "don't bot",
       "no me bot"
     ],
+    "humanize": {
+      "_note": "Makes the cadence read like a person rather than a scheduler (ideas file, section 3).",
+      "enabled": true,
+      "jitter_minutes": 4,
+      "skip_slot_chance": 0.15,
+      "affinity_bias": true,
+      "affinity_weight": 0.6,
+      "stop_markers": [
+        "#stopbot"
+      ],
+      "stop_lookback_hours": 24,
+      "_hour_weights_note": "Optional hour -> 0..1 activity weighting. Below 1 raises the skip chance for that hour so the bot idles in the trough. Empty = uniform.",
+      "hour_weights": {}
+    },
+    "digest": {
+      "_note": "Once a day, post a thread-starter with the top posts of the window, so the feeds get advertised to people who do not know they exist.",
+      "enabled": true,
+      "dry_run": false,
+      "per_day": 1,
+      "post_at_hour": 20,
+      "top_n": 5,
+      "max_age_hours": 24,
+      "min_likes": 15,
+      "exclude_owner": true,
+      "title": "Top of the Leftist list today",
+      "subtitle": "Los 5 posts con más engagement de las últimas 24h en la lista Leftist 🧵",
+      "_limits_note": "Bluesky allows 300 graphemes per post, which fits about one link, so the digest is posted as a thread: root + one reply per post.",
+      "footer": "Más en los feeds Leftist: bsky.app/profile/criticalnexus.bsky.social"
+    },
     "repost": {
       "enabled": true,
       "dry_run": false,
@@ -292,7 +321,7 @@
       "max_per_run": 1,
       "batch_size": 150,
       "max_per_author_per_day": 1,
-      "author_cooldown_days": 5,
+      "author_cooldown_days": 7,
       "skip_replies": true,
       "skip_reposts": true,
       "skip_sensitive": true,
@@ -316,9 +345,9 @@
       "skip_replies": true,
       "skip_reposts": true,
       "skip_sensitive": true,
-      "langs": null
+      "langs": null,
+      "author_cooldown_days": 0
     },
-
     "repost_cycle": {
       "_note": "Keep specific posts circulating: re-repost each one every interval_hours inside the window. mode=refresh deletes our previous repost first, so the post carries a fresh repost timestamp instead of accumulating duplicate repost records.",
       "enabled": true,
@@ -335,7 +364,6 @@
         "at://did:plc:bnjxoctfnukack6evxsbexc4/app.bsky.feed.post/3mujtc7oacc2a"
       ]
     },
-
     "saved_reposts": {
       "_note": "Repost a few random posts from the account's own bookmarks each day, spread across the window. Pinned posts are excluded so the two features never fight over the same post.",
       "enabled": true,

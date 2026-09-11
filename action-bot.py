@@ -31,6 +31,7 @@ Exit codes: 0 ok, 2 config/auth error, 3 API error.
 """
 import json
 import os
+import random
 import sys
 import time
 import urllib.error
@@ -136,6 +137,14 @@ CREATE TABLE IF NOT EXISTS saved_log (
     status TEXT,
     detail TEXT
 );
+CREATE TABLE IF NOT EXISTS digests (
+    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    at     REAL NOT NULL,
+    rkey   TEXT,
+    status TEXT,
+    uris   TEXT,
+    detail TEXT
+);
 """
 
 
@@ -143,6 +152,11 @@ def ensure_schema(con):
     """Self-healing: the bot must work even if it runs before feedgen ever
     created the database (the timer can fire independently)."""
     con.executescript(REQUIRED_TABLES)
+
+
+def meta_set(con, k, v):
+    con.execute("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                (k, str(v)))
 
 
 def rpc(host, method, data=None, token=None, timeout=30):
@@ -398,6 +412,11 @@ def collect_candidates(con, token, kind, mode_cfg):
     if kind == "repost":
         acted |= own_repost_subjects(token)
 
+    # human-like preference: bias toward mutuals and accounts you have liked
+    h = humanize_cfg()
+    affinity = affinity_authors(con) if h.get("affinity_bias") else {}
+    aff_w = float(h.get("affinity_weight", 0.6) or 0)
+
     posts = []
     with ThreadPoolExecutor(max_workers=10) as ex:
         for feed in ex.map(lambda a: fetch_author_posts(APPVIEW, a[0], 10), authors):
@@ -430,10 +449,13 @@ def collect_candidates(con, token, kind, mode_cfg):
             continue
         if s < (mode_cfg.get("min_score", 0) or 0):
             continue
+        if aff_w and affinity.get(did):
+            s = s * (1.0 + aff_w * affinity[did])
         out.append({"uri": uri, "cid": p.get("cid"), "did": did,
                     "handle": (p.get("author") or {}).get("handle"),
                     "score": round(s, 2), "age_h": round(age_h, 2),
                     "likes": p.get("likeCount", 0), "reposts": p.get("repostCount", 0),
+                    "affinity": round(affinity.get(did, 0.0), 2),
                     "text": (rec.get("text") or "")[:160]})
     out.sort(key=lambda r: (-r["score"], r["uri"]))
     return out
@@ -769,6 +791,309 @@ def do_saved_reposts(con, token, did_self, mc, args):
 
 
 # --------------------------------------------------------------------------
+# human-like behaviour (see the ideas file, section 3)
+# --------------------------------------------------------------------------
+
+def humanize_cfg():
+    h = dict(ACT.get("humanize") or {})
+    h.setdefault("enabled", True)
+    h.setdefault("jitter_minutes", 4)
+    h.setdefault("skip_slot_chance", 0.15)
+    h.setdefault("affinity_bias", True)
+    h.setdefault("affinity_weight", 0.6)
+    h.setdefault("stop_markers", ["#stopbot"])
+    h.setdefault("stop_lookback_hours", 24)
+    h.setdefault("hour_weights", {})
+    return h
+
+
+def affinity_authors(con):
+    """Authors worth biasing toward: mutuals, and accounts the owner has liked.
+
+    `taste` is built by feedgen from the owner's own likes; `follows` holds both
+    directions, so mutuals are the intersection.
+    """
+    out = {}
+    try:
+        for r in con.execute("SELECT actor_did, subject_did, direction FROM follows"):
+            if r["direction"] == "follows":
+                out.setdefault(r["subject_did"], set()).add("out")
+            else:
+                out.setdefault(r["actor_did"], set()).add("in")
+    except sqlite3.Error:
+        pass
+    for did, dirs in list(out.items()):
+        out[did] = 1.0 if dirs == {"in", "out"} else 0.4
+    try:
+        rows = con.execute("SELECT author_did, likes_count FROM taste").fetchall()
+        if rows:
+            top = max(r["likes_count"] for r in rows) or 1
+            for r in rows:
+                liked = r["likes_count"] / top
+                out[r["author_did"]] = min(1.0, out.get(r["author_did"], 0.0) + 0.6 * liked)
+    except sqlite3.Error:
+        pass
+    return out
+
+
+def maybe_delay():
+    """Sleep a random amount before acting, so ticks are not on exact marks."""
+    h = humanize_cfg()
+    if not h.get("enabled"):
+        return 0.0
+    secs = random.uniform(0, float(h.get("jitter_minutes", 4)) * 60)
+    print(f"[bot] jitter: sleeping {secs/60:.1f} min before acting", flush=True)
+    time.sleep(secs)
+    return secs
+
+
+def maybe_skip_slot(kind):
+    """Occasionally skip an eligible slot entirely, and honour hour weighting."""
+    h = humanize_cfg()
+    if not h.get("enabled"):
+        return False
+    skip = float(h.get("skip_slot_chance", 0) or 0)
+    weights = h.get("hour_weights") or {}
+    hour = str(datetime.now().hour)
+    if hour in weights:
+        try:
+            w = float(weights[hour])
+            skip = max(skip, 1.0 - max(0.0, min(1.0, w)))
+        except (TypeError, ValueError):
+            pass
+    if skip > 0 and random.random() < skip:
+        print(f"[bot] {kind}: skipping this slot (chance {skip:.0%})", flush=True)
+        return True
+    return False
+
+
+def stop_requested(con, token):
+    """Kill switch readable from Bluesky: a recent post containing #stopbot."""
+    h = humanize_cfg()
+    markers = [m.lower() for m in (h.get("stop_markers") or [])]
+    if not markers:
+        return None
+    lookback = float(h.get("stop_lookback_hours", 24)) * 3600
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=lookback)).isoformat()
+    try:
+        q = urllib.parse.urlencode({"actor": OWNER_DID, "limit": 20,
+                                    "filter": "posts_no_replies"})
+        d = rpc(APPVIEW, f"app.bsky.feed.getAuthorFeed?{q}", token=token, timeout=30)
+    except Exception as e:
+        print(f"[bot] stop-marker check unavailable: {e}", flush=True)
+        return None
+    for it in d.get("feed", []):
+        p = it.get("post") or {}
+        ts = (p.get("record") or {}).get("createdAt")
+        if not ts or ts < cutoff:
+            continue
+        text = ((p.get("record") or {}).get("text") or "").lower()
+        for m in markers:
+            if m in text:
+                return m
+    return None
+
+
+def overflow_note(con, kind, rows, cap):
+    """Daily output safety net: instead of posting beyond `cap`, keep a file."""
+    path = os.path.join(BASE, "overflow.md")
+    with open(path, "a") as fh:
+        fh.write(f"\n## {datetime.now():%Y-%m-%d %H:%M} — {kind} overflow "
+                 f"(>{cap}/day)\n")
+        for r in rows:
+            fh.write(f"- [{r.get('score')}] @{r.get('handle')} "
+                     f"{r.get('uri')} :: {(r.get('text') or '')[:120]}\n")
+    print(f"[bot] {kind}: daily soft cap {cap} reached — {len(rows)} kept in "
+          f"{path} instead of posted", flush=True)
+
+
+# --------------------------------------------------------------------------
+# daily digest post
+# --------------------------------------------------------------------------
+
+def build_facets(text, links):
+    """Link facets need *byte* offsets into the UTF-8 text, not char offsets."""
+    facets = []
+    for sub, uri in links:
+        idx = text.find(sub)
+        if idx < 0:
+            continue
+        start = len(text[:idx].encode("utf-8"))
+        end = start + len(sub.encode("utf-8"))
+        facets.append({"index": {"byteStart": start, "byteEnd": end},
+                       "features": [{"$type": "app.bsky.richtext.facet#link",
+                                     "uri": uri}]})
+    return facets
+
+
+def digest_candidates(con, mc):
+    """Top-N posts by the same weighted score the feeds use."""
+    weights = dict(CFG["scoring"])
+    weights.update(mc.get("scoring") or {})
+    max_age = float(mc.get("max_age_hours", 24))
+    rows = con.execute(
+        "SELECT uri, cid, author_did, author_handle, indexed_at, like_count, "
+        "repost_count, quote_count, reply_count, text, first_seen FROM posts "
+        "WHERE last_seen > ?", (time.time() - 3 * 86400,)).fetchall()
+    owner_did = CFG.get("owner", {}).get("did")
+    exclude_owner = mc.get("exclude_owner", True)
+    min_likes = int(mc.get("min_likes", 0) or 0)
+    min_chars = int(mc.get("min_text_chars", 60) or 0)
+    min_words = int(mc.get("min_words", 6) or 0)
+    scored, seen_authors = [], set()
+    for r in rows:
+        ts = r["indexed_at"]
+        if not ts:
+            continue
+        try:
+            age_h = (datetime.now(timezone.utc)
+                     - datetime.fromisoformat(ts.replace("Z", "+00:00"))).total_seconds() / 3600
+        except (ValueError, TypeError):
+            continue
+        if age_h < 0 or age_h > max_age:
+            continue
+        if r["like_count"] < min_likes:
+            continue
+        if exclude_owner and r["author_did"] == owner_did:
+            continue
+        # a digest that advertises the feeds should not be emoji spam: require
+        # some actual prose, and count words rather than characters so that
+        # "👏👏👏👏" cannot pass on length.
+        text = (r["text"] or "").strip()
+        words = [w for w in text.split() if any(ch.isalpha() for ch in w)]
+        if len(text) < min_chars or len(words) < min_words:
+            continue
+        s = (r["like_count"] * weights.get("w_likes", 1.0)
+             + r["repost_count"] * weights.get("w_reposts", 3.0)
+             + r["quote_count"] * weights.get("w_quotes", 2.0)
+             + r["reply_count"] * weights.get("w_replies", 0.5))
+        scored.append((s, r, text))
+    scored.sort(key=lambda t: (-t[0], t[1]["uri"]))
+    picked = []
+    for s, r, text in scored:
+        if r["author_did"] in seen_authors:
+            continue                      # one post per author: a varied digest
+        seen_authors.add(r["author_did"])
+        picked.append({"score": round(s, 2), "uri": r["uri"], "cid": r["cid"],
+                       "handle": r["author_handle"] or "unknown",
+                       "likes": r["like_count"], "reposts": r["repost_count"],
+                       "text": text})
+        if len(picked) >= int(mc.get("top_n", 5)):
+            break
+    return picked
+
+
+def fit_text(text, limit=295):
+    """Bluesky caps a post at 300 *graphemes*. A grapheme is >= 1 codepoint, so
+    keeping the codepoint count under the limit is always safe (and avoids
+    vendoring a grapheme-segmentation table)."""
+    if len(text) <= limit:
+        return text
+    return text[:limit - 1].rstrip() + "…"
+
+
+def do_digest(con, token, did_self, mc, args):
+    """Post once a day, as a thread: the top posts of the window.
+
+    A single post cannot hold five post links plus any prose (300 graphemes is
+    about one link and a handle), so the digest is a thread-starter with one
+    reply per post.
+    """
+    dry = bool(mc.get("dry_run", True))
+    if "--dry-run" in args:
+        dry = True
+    if "--live" in args:
+        dry = False
+    now = datetime.now()
+    at_hour = int(mc.get("post_at_hour", 20))
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    # only a real post consumes the day's quota — a dry run must never block it
+    posted_today = con.execute(
+        "SELECT COUNT(*) c FROM digests WHERE status='ok' AND at>=?",
+        (day_start,)).fetchone()["c"]
+    per_day = int(mc.get("per_day", 1) or 0)
+    due = now.hour >= at_hour and posted_today < per_day
+    print(f"[bot] digest: posted_today={posted_today}/{per_day} at_hour={at_hour} "
+          f"due={due} dry={dry}", flush=True)
+    if not due:
+        con.execute("INSERT INTO bot_runs(mode,started,finished,candidates,acted,"
+                    "dry_run,note) VALUES(?,?,?,?,?,?,?)",
+                    ("digest", time.time(), time.time(), 0, 0, int(dry),
+                     "not due"))
+        return []
+
+    picks = digest_candidates(con, mc)
+    print(f"[bot] digest: {len(picks)} posts selected", flush=True)
+    if not picks:
+        con.execute("INSERT INTO bot_runs(mode,started,finished,candidates,acted,"
+                    "dry_run,note) VALUES(?,?,?,?,?,?,?)",
+                    ("digest", time.time(), time.time(), 0, 0, int(dry),
+                     "no candidates"))
+        return []
+
+    title = mc.get("title", "Top of the Leftist list today")
+    subtitle = mc.get("subtitle", "").strip()
+    root_text = fit_text(f"{title}\n\n{subtitle}" if subtitle else title)
+
+    entries = []
+    for i, p in enumerate(picks, 1):
+        rkey = p["uri"].rsplit("/", 1)[-1]
+        url = f"https://bsky.app/profile/{p['handle']}/post/{rkey}"
+        snippet = " ".join(p["text"].split())[:150]
+        entries.append({
+            "text": fit_text(f"{i}) ❤ {p['likes']} · 🔁 {p['reposts']} · "
+                             f"@{p['handle']}\n{url}\n{snippet}"),
+            "links": [(url, url)], "uri": p["uri"]})
+
+    if dry:
+        print("[bot] DRY digest thread:\n" + root_text, flush=True)
+        for e in entries:
+            print("[bot]   ↳ " + e["text"], flush=True)
+        con.execute("INSERT INTO digests(at,status,uris,detail) VALUES(?,?,?,?)",
+                    (time.time(), "dry", json.dumps([p["uri"] for p in picks]),
+                     root_text + "\n---\n" + "\n---\n".join(e["text"] for e in entries)))
+        return [f"DRY digest thread ({len(entries) + 1} posts)"]
+
+    made = []
+    try:
+        res = rpc(PDS, "com.atproto.repo.createRecord", {
+            "repo": did_self, "collection": "app.bsky.feed.post",
+            "record": {"$type": "app.bsky.feed.post", "text": root_text,
+                       "createdAt": datetime.now(timezone.utc).isoformat()
+                                    .replace("+00:00", "Z")}}, token)
+        root_uri = res["uri"]
+        root_cid = res["cid"]
+        root_rkey = root_uri.rsplit("/", 1)[-1]
+        made.append(root_uri)
+        parent = {"uri": root_uri, "cid": root_cid}
+        for e in entries:
+            rec = {"$type": "app.bsky.feed.post", "text": e["text"],
+                   "facets": build_facets(e["text"], e["links"]),
+                   "reply": {"root": {"uri": root_uri, "cid": root_cid},
+                             "parent": parent},
+                   "createdAt": datetime.now(timezone.utc).isoformat()
+                                .replace("+00:00", "Z")}
+            r = rpc(PDS, "com.atproto.repo.createRecord", {
+                "repo": did_self, "collection": "app.bsky.feed.post",
+                "record": rec}, token)
+            made.append(r["uri"])
+            parent = {"uri": r["uri"], "cid": r["cid"]}
+            time.sleep(0.7)          # a thread is nicer to read if it lands in order
+
+        con.execute("INSERT INTO digests(at,rkey,status,uris,detail) "
+                    "VALUES(?,?,?,?,?)",
+                    (time.time(), root_rkey, "ok",
+                     json.dumps([p["uri"] for p in picks]),
+                     json.dumps(made)))
+        return [f"OK  digest thread posted ({len(made)} posts) root={root_rkey}"]
+    except Exception as e:
+        con.execute("INSERT INTO digests(at,status,uris,detail) VALUES(?,?,?,?)",
+                    (time.time(), "fail", json.dumps([p["uri"] for p in picks]),
+                     f"{e} | made={made}"))
+        return [f"ERR digest: {e} (posted {len(made)} before failing)"]
+
+
+# --------------------------------------------------------------------------
 # report / main
 # --------------------------------------------------------------------------
 
@@ -838,16 +1163,31 @@ def main(argv):
         print(f"Bluesky auth error: {e}", file=sys.stderr)
         return 2
     token, did_self = sess["accessJwt"], sess["did"]
+
+    # kill switch you can hit from Bluesky itself: a recent post with #stopbot
+    con0 = db()
+    marker = stop_requested(con0, token)
+    if marker:
+        meta_set(con0, "stopped_by_marker", f"{marker} @ {datetime.now():%Y-%m-%d %H:%M}")
+        print(f"[bot] STOP marker '{marker}' found in a recent post — no actions "
+              f"taken. Delete that post to resume.", flush=True)
+        return 0
+
     try:
         refresh_follows(con, token)
     except Exception as e:
         print(f"[bot] follow refresh error: {e}", flush=True)
 
     all_lines = []
-    # pinned "keep circulating" reposts and random saved-post reposts run first:
-    # they are explicit instructions, not best-effort picks from the follow graph.
+    # jitter first: ticks should not land on exact :00/:10/:20 marks
+    if not only:
+        maybe_delay()
+
+    # pinned "keep circulating" reposts, random saved-post reposts and the daily
+    # digest run first: they are explicit instructions, not best-effort picks.
     for name, fn in (("repost_cycle", do_repost_cycle),
-                     ("saved_reposts", do_saved_reposts)):
+                     ("saved_reposts", do_saved_reposts),
+                     ("digest", do_digest)):
         mc = ACT.get(name) or {}
         if not mc.get("enabled"):
             continue
@@ -882,9 +1222,26 @@ def main(argv):
                         "acted,dry_run,note) VALUES(?,?,?,?,?,?,?)",
                         (kind, time.time(), time.time(), 0, 0, int(dry), "nothing due"))
             continue
+        if not only and maybe_skip_slot(kind):
+            con.execute("INSERT INTO bot_runs(mode,started,finished,candidates,"
+                        "acted,dry_run,note) VALUES(?,?,?,?,?,?,?)",
+                        (kind, time.time(), time.time(), 0, 0, int(dry),
+                         "slot skipped (humanize)"))
+            continue
         cands = collect_candidates(con, token, kind, mc)
         print(f"[bot] {kind}: {len(cands)} candidates from "
               f"{int(mc.get('batch_size', 120))} authors", flush=True)
+
+        # daily output safety net: past the soft cap, keep the rest in a file
+        soft_cap = mc.get("daily_soft_cap")
+        if soft_cap is not None:
+            room = int(soft_cap) - today
+            if room <= 0:
+                if cands:
+                    overflow_note(con, kind, cands, soft_cap)
+                continue
+            due = min(due, room)
+
         acted, lines = act(con, token, did_self, kind, cands, mc, dry,
                            min(due, max_per_run))
         all_lines.extend(lines)
